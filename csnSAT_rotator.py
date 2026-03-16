@@ -4,12 +4,12 @@
   CYYZ Wind Direction → Antenna Rotator Controller
   Author  : Michael Walker  VA3MW
   Date    : 2026-03-16
-  Version : 1.3
+  Version : 1.4
 ================================================================================
 
 PURPOSE
 -------
-  Keeps a CSN Sat controlled rotator pointed into the prevailing wind  
+  Keeps a CSN SAT rotator controller pointed into the prevailing wind
   so that a directional antenna is always aligned with the wind.
 
   The script is "polite" — it will NOT move the antenna if another application
@@ -26,19 +26,25 @@ HOW IT WORKS
      <AZIMUTH> or <ELEVATION> commands that originate from other programs.
      When one is detected the timestamp is recorded.
 
-  2. The main loop wakes up every INTERVAL_SEC seconds (default 5 minutes).
-     Before sending anything it checks two conditions:
-       a) Has it been at least IDLE_TIMEOUT seconds since the last external
+  2. A keyboard thread watches for P and R keypresses:
+       P  →  Pause  — suspends all automatic antenna updates
+       R  →  Resume — re-enables automatic antenna updates
+
+  3. The main loop wakes up every INTERVAL_SEC seconds (default 5 minutes).
+     Before sending anything it checks three conditions:
+       a) Is the script paused by the user (P key)?
+          If so → skip until R is pressed.
+       b) Has it been at least IDLE_TIMEOUT seconds since the last external
           positioning command?  If not → skip (antenna in use).
-       b) Is the current CYYZ wind speed above MIN_WIND_KT?
+       c) Is the current CYYZ wind speed above MIN_WIND_KT?
           If not → skip (wind too light to matter).
-     If both conditions pass it fetches the METAR, extracts wind direction,
+     If all conditions pass it fetches the METAR, extracts wind direction,
      and sends ELEVATION=0 + AZIMUTH=<wind direction> to the SAT controller.
 
 
 HARDWARE / NETWORK SETUP
 ------------------------
-  - A CSN SAT  rotator controller or any
+  - A CSN SAT rotator connected to a SAT (Satellite Antenna Tracker) or any
     PSTRotator-compatible controller on your LAN.
   - The SAT must be reachable at SAT_HOST on your local network.
   - The computer running this script must be able to reach the internet to
@@ -46,7 +52,7 @@ HARDWARE / NETWORK SETUP
 
 THINGS YOU MAY NEED TO EDIT
 ----------------------------
-  SAT_HOST     IP address of your SAT controller
+  SAT_HOST     IP address of your SAT / PSTRotator controller
   SAT_PORT     UDP port the SAT listens on for commands   (default 12000)
   LISTEN_PORT  UDP port this script listens on for commands from other apps
                (default 12001 — the port the SAT sends responses back on)
@@ -55,6 +61,11 @@ THINGS YOU MAY NEED TO EDIT
                (default 300 = 5 min)
   MIN_WIND_KT  Minimum wind speed in knots to trigger a move (default 13)
   ICAO         Airport ICAO code for weather source       (default CYYZ)
+
+KEYBOARD COMMANDS
+-----------------
+  P  —  Pause  : suspend automatic antenna updates (antenna stays put)
+  R  —  Resume : re-enable automatic antenna updates
 
 DEPENDENCIES
 ------------
@@ -79,6 +90,7 @@ METAR SOURCES (tried in order, first success wins)
 """
 
 import logging
+import msvcrt   # Windows-only: non-blocking keyboard input
 import re
 import socket
 import sys
@@ -92,7 +104,7 @@ import requests
 #  CONFIGURATION  ←  Edit these values to match your setup
 # ══════════════════════════════════════════════════════════════════════════════
 
-SAT_HOST     = "xxx.xxx.xxx.xxx"  # IP address of your SAT / PSTRotator box
+SAT_HOST     = "xxx.xxx.xxx.xxx"  # IP address of your SAT Controller box
 SAT_PORT     = 12000              # UDP port the SAT listens on for commands
 LISTEN_PORT  = 12001              # UDP port to monitor for other apps' commands
 
@@ -100,8 +112,7 @@ INTERVAL_SEC = 300   # Main loop interval in seconds (300 = 5 minutes)
 IDLE_TIMEOUT = 300   # Seconds of quiet before we consider the antenna free
 MIN_WIND_KT  = 13    # Minimum wind speed (knots) required to reposition
 
-ICAO = "CYYZ"        # ICAO airport code for weather — change for other sites (Toronto Shown)
-
+ICAO = "CYYZ"        # ICAO airport code for weather — change for other sites
 
 # METAR data sources — tried in order; first successful response is used
 METAR_SOURCES = [
@@ -126,15 +137,48 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Shared state (listener thread ↔ main loop) ────────────────────────────────
-# _last_cmd_time holds the epoch timestamp of the most recent positioning
-# command detected on LISTEN_PORT.  Value 0.0 means none seen yet this session.
+# ── Shared state (all threads read/write these) ───────────────────────────────
+
+# Timestamp of the last external positioning command seen on LISTEN_PORT.
+# Value 0.0 means no command has been seen yet this session.
 _last_cmd_time: float = 0.0
-_last_cmd_lock = threading.Lock()   # guards _last_cmd_time for thread safety
+_last_cmd_lock = threading.Lock()
+
+# Pause flag — set True by P keypress, False by R keypress.
+# When True the main loop skips all antenna updates.
+_paused: bool = False
+_pause_lock = threading.Lock()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  LISTENER THREAD
+#  KEYBOARD THREAD  —  P to pause, R to resume
+# ══════════════════════════════════════════════════════════════════════════════
+
+def keyboard_thread() -> None:
+    """
+    Background daemon thread — polls for keypresses using msvcrt (Windows).
+    P  →  sets _paused = True   (suspends antenna updates)
+    R  →  sets _paused = False  (resumes antenna updates)
+    Any other key is silently ignored.
+    Polls every 100 ms so it stays responsive without burning CPU.
+    """
+    global _paused
+
+    while True:
+        if msvcrt.kbhit():
+            key = msvcrt.getch().decode("utf-8", errors="ignore").upper()
+            with _pause_lock:
+                if key == "P":
+                    _paused = True
+                    log.info("[keyboard] PAUSED — automatic updates suspended. Press R to resume.")
+                elif key == "R":
+                    _paused = False
+                    log.info("[keyboard] RESUMED — automatic updates re-enabled.")
+        time.sleep(0.1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LISTENER THREAD  —  watches for external antenna commands on UDP 12001
 # ══════════════════════════════════════════════════════════════════════════════
 
 def listener_thread() -> None:
@@ -269,12 +313,12 @@ def main() -> None:
     log.info(f"  Interval   : every {INTERVAL_SEC // 60} min")
     log.info(f"  Idle guard : {IDLE_TIMEOUT // 60} min after last external command")
     log.info(f"  Wind min   : {MIN_WIND_KT} kt  (below this, antenna is not moved)")
-    log.info("  Press Ctrl+C to stop.")
+    log.info("  Keys       : P = Pause,  R = Resume,  Ctrl+C = Quit")
     log.info("=" * 70)
 
-    # Start the background listener as a daemon (dies automatically when main exits)
-    t = threading.Thread(target=listener_thread, daemon=True, name="listener")
-    t.start()
+    # Start background daemon threads (all die automatically when main exits)
+    threading.Thread(target=listener_thread, daemon=True, name="listener").start()
+    threading.Thread(target=keyboard_thread, daemon=True, name="keyboard").start()
 
     # UDP socket used exclusively for sending commands to the SAT
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tx_sock:
@@ -286,7 +330,15 @@ def main() -> None:
             log.info("-" * 70)
             log.info("[main] Running scheduled check...")
 
-            # ── Guard 1: is another application using the antenna? ────────────
+            # ── Guard 1: has the user manually paused the script? ─────────────
+            with _pause_lock:
+                paused = _paused
+
+            if paused:
+                log.info("[main] SKIPPED — script is paused. Press R to resume.")
+                continue
+
+            # ── Guard 2: is another application using the antenna? ────────────
             with _last_cmd_lock:
                 idle_secs = time.time() - _last_cmd_time
 
@@ -306,7 +358,7 @@ def main() -> None:
                 log.error(f"[main] SKIPPED — could not retrieve weather: {exc}")
                 continue
 
-            # ── Guard 2: is the wind strong enough to bother moving? ──────────
+            # ── Guard 3: is the wind strong enough to bother moving? ──────────
             if wspd <= MIN_WIND_KT:
                 log.info(
                     f"[main] SKIPPED — wind speed {wspd} kt is at or below "
