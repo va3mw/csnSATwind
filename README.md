@@ -113,7 +113,7 @@ The app also monitors **UDP port 12001** for PSTRotator commands from any other 
 Open `csnsat-windtrack.py` in a text editor. The constants near the top of the file are the only values you should need to change:
 
 ```python
-SAT_HOST_DEFAULT = "192.168.113.121"  # fallback IP if discovery fails
+SAT_HOST_DEFAULT = "192.168.113.121"  # this is a place holder value
 SAT_PORT         = 12000   # CSN SAT command port
 LISTEN_PORT      = 12001   # monitor for external PSTRotator commands
 DISCOVERY_PORT   = 9932    # CSNTracker broadcast port
@@ -123,7 +123,7 @@ INTERVAL_SEC = 300         # weather check interval (seconds)
 IDLE_TIMEOUT = 300         # antenna-in-use guard timeout (seconds)
 MIN_GUST_KT  = 15          # minimum gust speed to trigger a move (knots)
 
-ICAO_DEFAULT = "CYYZ"      # pre-filled default in the startup dialog
+ICAO_DEFAULT = "CYYZ"      # pre-filled default in the startup dialog, place holder
 ```
 
 ---
