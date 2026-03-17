@@ -155,3 +155,6 @@ METARs are typically updated **hourly**, with special SPECI reports issued autom
 ## License
 
 MIT — free to use, modify, and distribute.
+<img width="1014" height="849" alt="csn wind tracker" src="https://github.com/user-attachments/assets/dfb14f63-ba01-4aef-b514-4dbd51df4c79" />
+
+
