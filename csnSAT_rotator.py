@@ -4,7 +4,7 @@
   CSN SAT Wind Tracker
   Author  : Michael Walker  VA3MW
   Date    : 2026-03-17
-  Version : 2.0
+  Version : 2.1
 ================================================================================
 
 PURPOSE
@@ -54,7 +54,6 @@ HOW IT WORKS
 THINGS YOU MAY NEED TO EDIT
 ----------------------------
   SAT_PORT       UDP port the SAT listens on for commands       (default 12000)
-  LISTEN_PORT    UDP port monitored for other apps' commands    (default 12001)
   DISCOVERY_PORT UDP port CSNTracker broadcasts on             (default 9932)
   DISCOVERY_SECS Seconds to wait for auto-discovery            (default 30)
   INTERVAL_SEC   How often the worker loop runs, in seconds    (default 300)
@@ -111,6 +110,8 @@ from datetime import datetime
 import requests
 
 
+VERSION = "2.1"
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION  ←  edit these values to match your setup
 # ══════════════════════════════════════════════════════════════════════════════
@@ -118,7 +119,6 @@ import requests
 SAT_HOST_DEFAULT = "192.168.113.121"  # fallback if discovery fails and user
                                        # leaves the entry dialog blank
 SAT_PORT         = 12000   # SAT listens for PSTRotator commands on this port
-LISTEN_PORT      = 12001   # monitor for other apps' PSTRotator commands
 DISCOVERY_PORT   = 9932    # CSNTracker broadcasts status on this port
 DISCOVERY_SECS   = 30      # seconds to wait for a CSNTracker broadcast
 
@@ -211,12 +211,12 @@ class App:
         #                 and ongoing CSNTracker event monitoring.  It sets
         #                 _discovery_done when the discovery phase is complete.
         # worker        — waits for _discovery_done, then runs the wind loop.
-        # listener_12001— watches for PSTRotator commands from other apps.
         # keepalive     — resends the last azimuth/elevation every 60 s.
+        # poll_sat      — polls http://{sat}/track; 30 s idle / 5 min tracking.
         threading.Thread(target=self._runner_9932,     daemon=True, name="9932").start()
         threading.Thread(target=self._worker,          daemon=True, name="worker").start()
-        threading.Thread(target=self._listener_12001,  daemon=True, name="lst-12001").start()
         threading.Thread(target=self._keepalive,       daemon=True, name="keepalive").start()
+        threading.Thread(target=self._poll_sat_status, daemon=True, name="poll-sat").start()
 
         # ── Recurring GUI callbacks ───────────────────────────────────────────
         self._drain_log()   # 100 ms — flush log queue → Text widget
@@ -227,19 +227,31 @@ class App:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _build_ui(self):
+        self._compact = False   # tracks whether the compact view is active
+
         # Title bar
-        bar = tk.Frame(self.root, bg=C_HDR, pady=14)
-        bar.pack(fill="x")
-        tk.Label(bar, text="  CSN SAT Wind Tracker",
+        self._bar = tk.Frame(self.root, bg=C_HDR, pady=14)
+        self._bar.pack(fill="x")
+        bar = self._bar
+        tk.Label(bar, text=f"  CSN SAT Wind Tracker  v{VERSION}",
                  bg=C_HDR, fg="white",
                  font=("Segoe UI", 15, "bold")).pack(side="left")
-        tk.Label(bar, text="Michael Walker  VA3MW  ",
+        tk.Label(bar, text=f"Michael Walker  VA3MW  ",
                  bg=C_HDR, fg="#7aaabf",
                  font=("Segoe UI", 10)).pack(side="right")
+        # Compact toggle — ⊟ collapses to button row only, ⊞ restores full view
+        self._compact_icon = tk.StringVar(value="⊟")
+        tk.Button(bar, textvariable=self._compact_icon,
+                  command=self._toggle_compact,
+                  bg=C_HDR, fg="#7aaabf",
+                  activebackground=C_HDR, activeforeground="white",
+                  font=("Segoe UI", 14), relief="flat",
+                  cursor="hand2", bd=0, padx=10).pack(side="right")
 
         # Three info cards
-        row = tk.Frame(self.root, bg=C_BG)
-        row.pack(fill="x", padx=12, pady=10)
+        self._cards_row = tk.Frame(self.root, bg=C_BG)
+        self._cards_row.pack(fill="x", padx=12, pady=10)
+        row = self._cards_row
         row.columnconfigure(0, weight=1)
         row.columnconfigure(1, weight=1)
         row.columnconfigure(2, weight=1)
@@ -248,11 +260,13 @@ class App:
         self._build_card_antenna(row, 2)
 
         # Divider
-        tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill="x", padx=12)
+        self._divider1 = tk.Frame(self.root, bg=C_BORDER, height=1)
+        self._divider1.pack(fill="x", padx=12)
 
         # Control buttons
-        btn_row = tk.Frame(self.root, bg=C_BG, pady=8)
-        btn_row.pack(fill="x", padx=12)
+        self._btn_row = tk.Frame(self.root, bg=C_BG, pady=8)
+        self._btn_row.pack(fill="x", padx=12)
+        btn_row = self._btn_row
         self._button(btn_row, "⏸   PAUSE",    "#3d1f00", C_ORANGE,
                      self._do_pause).pack(side="left", padx=(0, 8))
         self._button(btn_row, "▶   RESUME",   "#0f2e0f", C_GREEN,
@@ -266,11 +280,13 @@ class App:
             self.root.bind(key, lambda _: self._do_resume())
 
         # Divider
-        tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill="x", padx=12)
+        self._divider2 = tk.Frame(self.root, bg=C_BORDER, height=1)
+        self._divider2.pack(fill="x", padx=12)
 
         # Event log
-        log_frame = tk.Frame(self.root, bg=C_BG)
-        log_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self._log_frame = tk.Frame(self.root, bg=C_BG)
+        self._log_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        log_frame = self._log_frame
         tk.Label(log_frame, text="  EVENT LOG",
                  bg=C_HDR, fg=C_DIM,
                  font=("Segoe UI", 8, "bold"),
@@ -297,6 +313,45 @@ class App:
         self._log_box.tag_config("discover", foreground="#c084fc")
         self._log_box.tag_config("tx",       foreground="#8888cc")
         self._log_box.tag_config("sat",      foreground="#f0a050")  # CSNTracker events
+
+    def _toggle_compact(self):
+        """
+        Collapse the window to just the button row (⊟) or restore the full
+        view (⊞).  Uses pack's 'after' option so sections re-appear in the
+        correct order when restoring.
+        """
+        if not self._compact:
+            # ── Go compact ────────────────────────────────────────────────────
+            self._saved_geometry = self.root.geometry()   # remember full size
+            self._cards_row.pack_forget()
+            self._divider1.pack_forget()
+            self._divider2.pack_forget()
+            self._log_frame.pack_forget()
+            self._compact_icon.set("⊞")
+            self.root.minsize(0, 0)
+            self.root.update_idletasks()
+            # Shrink window height to fit title bar + button row only
+            w = max(self.root.winfo_width(), 380)
+            h = self.root.winfo_reqheight()
+            self.root.geometry(f"{w}x{h}")
+            self._compact = True
+        else:
+            # ── Restore full view ─────────────────────────────────────────────
+            # Re-insert sections in the correct pack order using 'after'
+            self._cards_row.pack(fill="x", padx=12, pady=10,
+                                 after=self._bar)
+            self._divider1.pack(fill="x", padx=12,
+                                after=self._cards_row)
+            # _btn_row is already packed; it naturally sits after _divider1
+            self._divider2.pack(fill="x", padx=12,
+                                after=self._btn_row)
+            self._log_frame.pack(fill="both", expand=True,
+                                 padx=12, pady=(0, 12),
+                                 after=self._divider2)
+            self._compact_icon.set("⊟")
+            self.root.minsize(900, 640)
+            self.root.geometry(self._saved_geometry)
+            self._compact = False
 
     # ── Card / field helpers ──────────────────────────────────────────────────
 
@@ -462,6 +517,14 @@ class App:
             self._v_moved.set(datetime.now().strftime("%H:%M:%S"))
             self._v_action.set("MOVED")
             self._l_action.configure(fg=C_GREEN)
+        self.root.after(0, _f)
+
+    def _ui_live_position(self, az: float, el: float, tracking: bool):
+        """Update the ANTENNA card with the live position polled from the SAT."""
+        def _f():
+            self._v_az.set(f"{az:.1f}°")
+            self._l_az.configure(fg=C_CYAN if tracking else C_TEXT)
+            self._v_el.set(f"{el:.1f}°")
         self.root.after(0, _f)
 
     def _ui_skipped(self, reason: str):
@@ -788,32 +851,108 @@ class App:
             self._ui_sat_event(f"LOS  az={az}°", C_DIM)
             self._wake.set()   # let the worker run a wind check right away
 
-    def _listener_12001(self):
+    def _poll_sat_status(self):
         """
-        Daemon — watches LISTEN_PORT for <AZIMUTH>/<ELEVATION> PSTRotator
-        commands from other apps and records the time they were last seen.
+        Daemon — polls http://{sat_host}/track and uses the 'mode' field to
+        determine whether the SAT is actively tracking a satellite.
+
+          mode = 1  →  SAT is tracking — mark antenna IN USE by refreshing
+                        _last_cmd_time so the wind tracker backs off.
+                        Poll interval: every 5 minutes (SAT is busy; rely on
+                        UDP SAT,LOS for the primary end-of-pass notification).
+          mode = 0  →  SAT is idle — clear _last_cmd_time immediately so wind
+                        tracking resumes.  Poll interval: every 30 seconds.
+
+        Also updates the ANTENNA card with the live az / el reported by the SAT,
+        coloured cyan while tracking and normal text when idle.
+
+        Waits for _discovery_done before starting so the SAT IP is known.
+        Falls back gracefully if the SAT does not support the HTTP API.
         """
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("", LISTEN_PORT))
-            s.settimeout(1.0)
-            self._log("INFO",
-                f"[listener] Monitoring :{LISTEN_PORT} for external positioning commands.")
-            while True:
-                try:
-                    data, addr = s.recvfrom(4096)
-                    msg = data.decode("ascii", errors="replace").strip()
-                    if "<AZIMUTH>" in msg or "<ELEVATION>" in msg:
+        self._discovery_done.wait()   # need _sat_host to be set first
+
+        url = f"http://{self._sat_host}/track"
+        self._log("INFO", f"[sat-poll] Starting HTTP status poll → {url}")
+
+        prev_mode    = None   # for log-spam guard only; reset to None on failures
+        was_tracking = False  # persists across failure streaks — True once mode=1 seen
+        fail_streak  = 0      # consecutive failures — only warn after 3 in a row
+        sleep_secs   = 30     # updated after each poll: 30 s idle / 300 s tracking
+
+        while True:
+            try:
+                r = requests.get(url, timeout=6)   # SAT may delay during critical ops
+                r.raise_for_status()
+                data = r.json()
+
+                fail_streak = 0   # reset on any successful response
+
+                mode = int(data.get("mode", 0))
+                az   = data.get("az")
+                el   = data.get("el")
+
+                # ── Mode transitions ─────────────────────────────────────────
+                if mode == 1:
+                    # Actively tracking — keep refreshing the in-use timer
+                    with self._cmd_lock:
+                        self._last_cmd_time = time.time()
+                    if prev_mode != 1:
+                        self._log("INFO",
+                            "[sat-poll] mode=1 — SAT is TRACKING, antenna IN USE.")
+                        self._ui_sat_event("TRACKING  (mode=1)", C_CYAN)
+                    was_tracking = True
+
+                else:   # mode == 0  — idle
+                    if was_tracking:
+                        # Pass just ended (poll observed mode=1 → mode=0, even if
+                        # there was a failure streak between the two observations).
                         with self._cmd_lock:
-                            self._last_cmd_time = time.time()
+                            self._last_cmd_time = 0.0
                         self._log("INFO",
-                            f"[listener] Cmd from {addr[0]}  →  {msg}")
-                        self._log("INFO",
-                            "[listener] Antenna marked IN USE — auto-control paused.")
-                except socket.timeout:
-                    continue
-                except Exception as exc:
-                    self._log("ERROR", f"[listener] {exc}")
+                            "[sat-poll] mode=0 — SAT is IDLE, antenna now FREE.")
+                        self._wake.set()   # let worker run a wind check right away
+                        self._ui_sat_event("IDLE  (mode=0)", C_DIM)
+                        was_tracking = False
+                    elif prev_mode != 0:
+                        # First idle observation at startup or after failure recovery.
+                        # Only update the label if the antenna is actually free;
+                        # if _last_cmd_time is still active (e.g. a UDP START TRACK
+                        # arrived while the poll was failing), leave the label alone
+                        # so it doesn't flash "IDLE" during an active satellite pass.
+                        with self._cmd_lock:
+                            lct = self._last_cmd_time
+                        if lct == 0 or time.time() - lct >= IDLE_TIMEOUT:
+                            self._ui_sat_event("IDLE  (mode=0)", C_DIM)
+
+                prev_mode = mode
+
+                # ── Live position update ──────────────────────────────────────
+                if az is not None and el is not None:
+                    self._ui_live_position(float(az), float(el), mode == 1)
+
+                # ── Poll interval ─────────────────────────────────────────────
+                # Idle  → 30 s  (light load; catches a new pass within half a minute)
+                # Tracking → 5 min (SAT is busy; UDP LOS is the primary end-of-pass
+                #                   notification — this poll is the fallback only)
+                sleep_secs = 300 if mode == 1 else 30
+
+            except Exception as exc:
+                fail_streak += 1
+                if fail_streak == 3:
+                    # Only log after 3 consecutive failures to avoid noise
+                    # when the SAT is briefly busy (e.g. right after a move command)
+                    self._log("WARNING",
+                        f"[sat-poll] {fail_streak} consecutive poll failures — "
+                        f"{type(exc).__name__}: {exc}")
+                elif fail_streak > 3 and fail_streak % 10 == 0:
+                    self._log("WARNING",
+                        f"[sat-poll] Still unreachable ({fail_streak} failures).")
+                prev_mode  = None
+                sleep_secs = 30   # retry at the idle rate after any failure
+                # NOTE: was_tracking is intentionally NOT reset here — a failure
+                # streak must not cause the poll to miss a mode=1 → mode=0 event.
+
+            time.sleep(sleep_secs)
 
     def _keepalive(self):
         """
@@ -837,10 +976,21 @@ class App:
                         continue
 
                 with self._cmd_lock:
-                    in_use = (self._last_cmd_time > 0 and
-                              time.time() - self._last_cmd_time < IDLE_TIMEOUT)
+                    lct = self._last_cmd_time
+                now = time.time()
+                in_use        = (lct > 0 and now - lct < IDLE_TIMEOUT)
+                just_expired  = (lct > 0 and now - lct >= IDLE_TIMEOUT)
                 if in_use:
                     continue
+                if just_expired:
+                    # IDLE_TIMEOUT elapsed without an explicit LOS or mode=0 poll
+                    # transition — clear the timer and update the label so the GUI
+                    # doesn't stay frozen at "TRACKING …".
+                    with self._cmd_lock:
+                        self._last_cmd_time = 0.0
+                    self._ui_sat_event("IDLE  (timeout)", C_DIM)
+                    self._log("INFO",
+                        "[keepalive] Satellite tracking timed out — antenna now FREE.")
 
                 try:
                     for inner in ("<ELEVATION>0.0</ELEVATION>",
